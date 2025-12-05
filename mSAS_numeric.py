@@ -3,6 +3,7 @@ from IPython.display import Markdown, display
 import numpy as np
 import matplotlib.pyplot as plt
 from math import pi, sqrt
+from time import time
 try:
     from scipy.integrate import solve_ivp
     SCIPY_AVAILABLE = True
@@ -74,6 +75,9 @@ S_coeff_D2_12 = 5/12
 S_coeff_D2_11 = 5/12
 S_coeff_D2_10 = 1/6
 S_coeff_D2_01 = 0
+
+# extra term from matching my derivation with einstein B convention, should be 3, but nonexistent (1) in the reference
+S_CONVENTION_CORRECTION = 3 # 3
 
 # Peak cross-section (sigma_0)
 sigma_D11_0 = 3 * lambda_D11**2 / (2 * np.pi)
@@ -208,8 +212,8 @@ def Bij_from_C11(omega_ij_rad, J_i, J_j, S_ij, GammaD_angular):
     """
     pref = (1.0/3.0) * (c**3) * (pi**2) / (hbar * (omega_ij_rad**3))
     factor = ((2.0 * J_j + 1.0) / (2.0 * J_i + 1.0))
-    B = pref * factor * S_ij * GammaD_angular
-    return B
+    B_ij = pref * factor * S_ij * GammaD_angular * S_CONVENTION_CORRECTION
+    return B_ij
 
 
 # ------------------------------
@@ -343,20 +347,21 @@ def steady_state_solver(rhs_fun, N0, t_max, dt=None, rtol=1e-6, atol=1e-9):
 # We will implement a function that given population arrays N1(v), Nj(v) returns the integrand and the α(ω).
 # ------------------------------
 
-def absorption_alpha_from_populations_v2(hbar, omega1j_rad, delta1j_Hz, k_freq, v_array, fD_v, Nj_pop, N1_pop, g_j, g1, GammaD1_Hz):
+def absorption_alpha_from_populations_v2(hbar, omega1j_rad, delta1j_Hz, k_freq, v_array, fD_v, Nj_pop, N1_pop, g_j, g1, GammaD1_Hz, B_1j):
     """
     Safer version: k_freq = 1/lambda (cycles/m); delta1j_Hz in Hz.
     Returns alpha (1/m).
     """
     # prefactor ℏ ω / c
-    pref = (hbar * omega1j_rad) / c
+    pref = (hbar * omega1j_rad) / c * B_1j
 
     # lineshape evaluated at (delta1j - k_freq * v) in Hz
     delta_v = delta1j_Hz + k_freq * v_array
     gH_vals = lorentzian_normalized(delta_v, GammaD1_Hz)   # units Hz^-1
 
     # integrand: fD(v) * gH( ... ) * (N1(v) - (g_j/g1) * N_j(v))
-    integrand = fD_v * gH_vals * (N1_pop - (g_j / g1) * Nj_pop)
+    # note: fD_v is omitted here because it's already included in N1_pop and Nj_pop
+    integrand = gH_vals * (N1_pop - (g_j / g1) * Nj_pop)
 
     integral = np.trapz(integrand, v_array)   # integral over v (m/s), output units: (1/m/s) ??? combined pref fixes units
     alpha = pref * integral
@@ -368,7 +373,7 @@ def k_freq_from_lambda(lambda_m):
 
 
 # ------------------------------
-# Part 3: Bichromatic SAS (bSAS)
+# Part 2: Monochromatic SAS (mSAS)
 # ------------------------------.
 # Requires: mb_1d_pdf, lorentzian_normalized, Bij_from_C11,
 #           R_rate_probe, R_rate_pump, partial_decay_rates_D1D2,
@@ -434,7 +439,7 @@ transitions_D1 = [
     {'label': '3-1', 'f': f_D11, 'lambda': lambda_D11, 'J_i': J_excited_D1, 'J_j': J_ground, 'S_ij': S_coeff_D1_11, 'GammaD_Hz': GammaD1_Hz},
     {'label': '4-1', 'f': f_D12, 'lambda': lambda_D12, 'J_i': J_excited_D1, 'J_j': J_ground, 'S_ij': S_coeff_D1_21, 'GammaD_Hz': GammaD1_Hz},
 ]
-B_map_D1 = build_Bij_for_transitions(transitions_D1)
+B_map = build_Bij_for_transitions(transitions_D1)
 
 # Also build Bij for pump transitions (D2 lines j=5..7) if needed (for mSAS pump and probe same source)
 transitions_D2 = [
@@ -446,7 +451,7 @@ transitions_D2 = [
     {'label': '6-1', 'f': f_D21, 'lambda': lambda_D21, 'J_i': J_excited_D2, 'J_j': J_ground, 'S_ij': S_coeff_D2_11, 'GammaD_Hz': GammaD2_Hz},
     {'label': '7-1', 'f': f_D22, 'lambda': lambda_D22, 'J_i': J_excited_D2, 'J_j': J_ground, 'S_ij': S_coeff_D2_21, 'GammaD_Hz': GammaD2_Hz},
 ]
-B_map_D2 = build_Bij_for_transitions(transitions_D2)
+B_map_pump = build_Bij_for_transitions(transitions_D2)
 
 # k_freq for each transition (cycles/m)
 k_probe_13 = k_freq_from_lambda(lambda_D11)
@@ -459,7 +464,7 @@ k_pump_17 = k_freq_from_lambda(lambda_D22)
 
 
 # --- ODE RHS for monochromatic SAS (Eq. C13) ---
-def rhs_bSAS_factory(v_i, probe_detuning_Hz, pump_freqs, I_pr_Wm2, I_pu_Wm2):
+def rhs_mSAS_factory(v_i, probe_detuning_Hz, pump_detuning_Hz, I_pr_Wm2, I_pu_Wm2):
     """
     Return an RHS function dN/dt for a given velocity class v_i and the current laser detunings.
     - probe_detuning_Hz : scalar detuning of probe from 1->3 (and 1->4) resonance (Hz)
@@ -469,28 +474,36 @@ def rhs_bSAS_factory(v_i, probe_detuning_Hz, pump_freqs, I_pr_Wm2, I_pu_Wm2):
     All rates returned in s^-1.
     """
     # precompute total rates
-    Rpr_1j = [0 for i in range(5)]  # index 0 unused
-    Rpr_1j[3] = R_rate_probe(B_map_D1['1-3'], I_pr_Wm2, probe_detuning_Hz - (f_D11 - f_D11), k_probe_13, v_i, GammaD1_Hz)
-    Rpr_1j[4] = R_rate_probe(B_map_D1['1-4'], I_pr_Wm2, probe_detuning_Hz - (f_D12 - f_D11), k_probe_14, v_i, GammaD1_Hz)
-    Rpr_j1 = [0 for i in range(5)]  # index 0 unused
-    Rpr_j1[3] = R_rate_probe(B_map_D1['3-1'], I_pr_Wm2, (probe_detuning_Hz - (f_D11 - f_D11)), k_probe_13, v_i, GammaD1_Hz)
-    Rpr_j1[4] = R_rate_probe(B_map_D1['4-1'], I_pr_Wm2, (probe_detuning_Hz - (f_D12 - f_D11)), k_probe_14, v_i, GammaD1_Hz)
+    Rpr_13 = R_rate_probe(B_map['1-3'], I_pr_Wm2, probe_detuning_Hz - (f_D11 - f_D11), k_probe_13, v_i, GammaD1_Hz)
+    Rpr_14 = R_rate_probe(B_map['1-4'], I_pr_Wm2, probe_detuning_Hz - (f_D12 - f_D11), k_probe_14, v_i, GammaD1_Hz)
+    Rpr_31 = R_rate_probe(B_map['3-1'], I_pr_Wm2, (probe_detuning_Hz - (f_D11 - f_D11)), k_probe_13, v_i, GammaD1_Hz)
+    Rpr_41 = R_rate_probe(B_map['4-1'], I_pr_Wm2, (probe_detuning_Hz - (f_D12 - f_D11)), k_probe_14, v_i, GammaD1_Hz)
 
-    Rpu_1j = [0 for i in range(8)]  # index 0 unused
-    Rpu_1j[5] = R_rate_pump(B_map_D2['1-5'], I_pu_Wm2, pump_freqs - f_D20, k_pump_15, v_i, GammaD2_Hz)
-    Rpu_1j[6] = R_rate_pump(B_map_D2['1-6'], I_pu_Wm2, pump_freqs - f_D21, k_pump_16, v_i, GammaD2_Hz)
-    Rpu_1j[7] = R_rate_pump(B_map_D2['1-7'], I_pu_Wm2, pump_freqs - f_D22, k_pump_17, v_i, GammaD2_Hz)
-    Rpu_j1 = [0 for i in range(8)]  # index 0 unused
-    Rpu_j1[5] = R_rate_pump(B_map_D2['5-1'], I_pu_Wm2, (pump_freqs - f_D20), k_pump_15, v_i, GammaD2_Hz)
-    Rpu_j1[6] = R_rate_pump(B_map_D2['6-1'], I_pu_Wm2, (pump_freqs - f_D21), k_pump_16, v_i, GammaD2_Hz)
-    Rpu_j1[7] = R_rate_pump(B_map_D2['7-1'], I_pu_Wm2, (pump_freqs - f_D22), k_pump_17, v_i, GammaD2_Hz)
+    Rpu_13 = R_rate_pump(B_map['1-3'], I_pu_Wm2, pump_detuning_Hz - (f_D11 - f_D11), k_pump_13, v_i, GammaD1_Hz)
+    Rpu_14 = R_rate_pump(B_map['1-4'], I_pu_Wm2, pump_detuning_Hz - (f_D12 - f_D11), k_pump_14, v_i, GammaD1_Hz)
+    Rpu_31 = R_rate_pump(B_map['3-1'], I_pu_Wm2, (pump_detuning_Hz - (f_D11 - f_D11)), k_pump_13, v_i, GammaD1_Hz)
+    Rpu_41 = R_rate_pump(B_map['4-1'], I_pu_Wm2, (pump_detuning_Hz - (f_D12 - f_D11)), k_pump_14, v_i, GammaD1_Hz)
 
     # Partial decay rates Γ_j1 and Γ_j2 in Hz
     rates = partial_rates  # mapping j->(Gamma_j1_Hz, Gamma_j2_Hz)
 
     def rhs(t, N):
         N1, N2, N3, N4, N5, N6, N7 = N
-        Ni = [0, N1, N2, N3, N4, N5, N6, N7]
+
+        # eq. (C13)
+        R_1j = [0, 0, 0, 0, 0]  # index 0 unused
+        R_1j[3] = Rpr_13 + Rpu_13
+        R_1j[4] = Rpr_14 + Rpu_14
+        R_j1 = [0, 0, 0, 0, 0]  # index 0 unused
+        R_j1[3] = Rpr_31 + Rpu_31
+        R_j1[4] = Rpr_41 + Rpu_41
+
+        # spontaneous decays from excited to ground:
+        Gamma31, Gamma32 = rates[3]
+        Gamma41, Gamma42 = rates[4]
+        Gamma51, Gamma52 = rates[5]
+        Gamma61, Gamma62 = rates[6]
+        Gamma71, Gamma72 = rates[7]
 
         # equilibrium populations for this velocity class (N_total_v will be passed externally; here we use placeholders)
         # The solver wrapper will set initial condition as N0 per v and also we need Gamma_tr and N0 to implement relaxation:
@@ -503,31 +516,28 @@ def rhs_bSAS_factory(v_i, probe_detuning_Hz, pump_freqs, I_pr_Wm2, I_pu_Wm2):
         Gamma_tr_local = rhs.Gamma_tr_local
 
         # Compose dN1/dt per Eq. (C13a)
-        pr_term = [Rpr_j1[j] * Ni[j] - Rpr_1j[j] * N1 for j in [3,4]]
-        pu_term = [Rpu_j1[j] * Ni[j] - Rpu_1j[j] * N1 for j in [5,6,7]]
-        spont_term_1 = [rates[j][0] * Ni[j] for j in [3,4,5,6,7]]
-        dN1dt = (np.sum(pr_term) + np.sum(pu_term) + np.sum(spont_term_1)) \
+        dN1dt = ((R_j1[3] * N3 - R_1j[3] * N1) + (R_j1[4] * N4 - R_1j[4] * N1)) \
+                + ( Gamma31 * N3 + Gamma41 * N4 ) \
                 + ( - Gamma_tr_local * (N1 - N1_0_local) )
 
         # dN2/dt : Eq (C13b)
-        spont_term_2 = [rates[j][1] * Ni[j] for j in [3,4,5,6,7]]
-        dN2dt = (np.sum(spont_term_2)) \
+        dN2dt = (Gamma32 * N3 + Gamma42 * N4) \
                 - Gamma_tr_local * (N2 - N2_0_local)
 
         # dN3/dt Eq (C13c)
-        dN3dt = - (Rpr_j1[3] * N3 - Rpr_1j[3] * N1) - (GammaD1_Hz + Gamma_tr_local) * N3
+        dN3dt = - (R_j1[3] * N3 - R_1j[3] * N1) - (GammaD1_Hz + Gamma_tr_local) * N3
 
         # dN4/dt Eq (C13d)
-        dN4dt = - (Rpr_j1[4] * N4 - Rpr_1j[4] * N1) - (GammaD1_Hz + Gamma_tr_local) * N4
+        dN4dt = - (R_j1[4] * N4 - R_1j[4] * N1) - (GammaD1_Hz + Gamma_tr_local) * N4
 
         # dN5/dt Eq (C13e)
-        dN5dt = - (Rpu_j1[5] * N5 - Rpu_1j[5] * N1) - (GammaD2_Hz + Gamma_tr_local) * N5
+        dN5dt = 0
 
         # dN6/dt Eq (C13d for j=6)
-        dN6dt = - (Rpu_j1[6] * N6 - Rpu_1j[6] * N1) - (GammaD2_Hz + Gamma_tr_local) * N6
+        dN6dt = 0
 
         # dN7/dt Eq (C13e for j=7)
-        dN7dt = - (Rpu_j1[7] * N7 - Rpu_1j[7] * N1) - (GammaD2_Hz + Gamma_tr_local) * N7
+        dN7dt = 0
         return np.array([dN1dt, dN2dt, dN3dt, dN4dt, dN5dt, dN6dt, dN7dt])
 
     # Attach placeholders for N1_0, N2_0, Gamma_tr to rhs so outer wrapper can set them
@@ -538,7 +548,7 @@ def rhs_bSAS_factory(v_i, probe_detuning_Hz, pump_freqs, I_pr_Wm2, I_pu_Wm2):
 
 
 # --- Wrapper: compute alpha(omega) by looping velocities and solving steady state ---
-def compute_bSAS_alpha(delta_array_Hz, pump_freqs, N_total, I_pr_Wm2, I_pu_Wm2,
+def compute_mSAS_alpha(delta_array_Hz, N_total, I_pr_Wm2, I_pu_Wm2,
                        v_max_factor=7.0, n_v=20001, t_end_factor=400.0):
     """
     delta_array_Hz: 1D array of probe detunings (Hz) relative to f_D11 (the reference)
@@ -579,6 +589,7 @@ def compute_bSAS_alpha(delta_array_Hz, pump_freqs, N_total, I_pr_Wm2, I_pu_Wm2,
     for di, delta_hz in enumerate(delta_array_Hz):
         # For monochromatic SAS: pump detuning = probe detuning (scanning same source)
         probe_detuning_Hz = delta_hz
+        pump_detuning_Hz = delta_hz
 
         # arrays to collect N1, N3, N4 as functions of v
         N1_v = np.zeros_like(v_grid)
@@ -587,7 +598,7 @@ def compute_bSAS_alpha(delta_array_Hz, pump_freqs, N_total, I_pr_Wm2, I_pu_Wm2,
 
         for idx, v_i in enumerate(v_grid):
             # create rhs for this velocity and detuning
-            rhs_fun = rhs_bSAS_factory(v_i, probe_detuning_Hz, pump_freqs, I_pr_Wm2, I_pu_Wm2)
+            rhs_fun = rhs_mSAS_factory(v_i, probe_detuning_Hz, pump_detuning_Hz, I_pr_Wm2, I_pu_Wm2)
 
             # set closure values for equilibrium N0 & Gamma_tr
             rhs_fun.N1_0 = N1_0_array[idx]
@@ -614,11 +625,11 @@ def compute_bSAS_alpha(delta_array_Hz, pump_freqs, N_total, I_pr_Wm2, I_pu_Wm2,
         # alpha for j=3
         alpha_13 = absorption_alpha_from_populations_v2(hbar, omega_13_rad, probe_detuning_Hz  - (f_D11 - f_D11),
                                                        k13, v_grid, fD_v, N3_v, N1_v,
-                                                       g_j=2*1+1, g1=g1, GammaD1_Hz=GammaD1_Hz)
+                                                       g_j=2*1+1, g1=g1, GammaD1_Hz=GammaD1_Hz, B_1j=B_map['1-3'])
         # alpha for j=4
         alpha_14 = absorption_alpha_from_populations_v2(hbar, omega_14_rad, probe_detuning_Hz - (f_D12 - f_D11),
                                                        k14, v_grid, fD_v, N4_v, N1_v,
-                                                       g_j=2*2+1, g1=g1, GammaD1_Hz=GammaD1_Hz)
+                                                       g_j=2*2+1, g1=g1, GammaD1_Hz=GammaD1_Hz, B_1j=B_map['1-4'])
         alpha_array[di] = alpha_13 + alpha_14
 
         # (optional) print progress
@@ -626,23 +637,17 @@ def compute_bSAS_alpha(delta_array_Hz, pump_freqs, N_total, I_pr_Wm2, I_pu_Wm2,
             print(f"mSAS: computed {di+1}/{len(delta_array_Hz)} detunings")
 
     return alpha_array
-
-
 # ------------------------------
 # Part 4: Final assembly + plotting (1x4 pump panels)
 # ------------------------------
-import numpy as np
-import matplotlib.pyplot as plt
-from time import time
-
 # ---------- User-tweakable parameters ----------
 # Detuning grid (Hz) relative to f_D11 (probe reference)
 delta_min_MHz = -500.0
 delta_max_MHz = 1500.0
-n_det = 2001   # number of detuning points (increase for smoother curves)
+n_det = 401   # number of detuning points (increase for smoother curves)
 
 # Velocity integration settings (these are heavy)
-v_max_factor = 7.0
+v_max_factor = 5.0
 n_v = 2001    # use 2001 for testing; 20001 for full accuracy is slow
 
 # Cell length for transmittance
@@ -666,29 +671,24 @@ show_components = True
 
 # ---------- build detuning array (Hz) ----------
 delta_array_MHz = np.linspace(delta_min_MHz, delta_max_MHz, n_det)
+# delta_array_MHz = np.array([750])  # single point test
 delta_array_Hz = delta_array_MHz * 1e6
 
 # ---------- compute the Doppler-averaged background mSAS alpha (slow) ----------
-print("computing Doppler-averaged alpha (bSAS).")
+print("computing Doppler-averaged alpha (mSAS).")
 print(f" detuning range: {delta_min_MHz} .. {delta_max_MHz} MHz, points = {n_det}")
 print(f" velocity grid n_v = {n_v}, v_max_factor = {v_max_factor}")
 t0 = time()
 # compute_mSAS_alpha should be defined in Part 2
-
-alpha_array = []
-for i in range(len(pump_freqs)):
-    print(f" Computing for pump {pump_labels[i]} at lambda = {pump_lambdas[i]*1e9:.2f} nm")
-    alpha_i = compute_bSAS_alpha(
-        delta_array_Hz,
-        pump_freqs[i],
-        N,                # total number density (m^-3) for the isotope (as in your constants)
-        I_pr_Wm2,
-        I_pu_Wm2,
-        v_max_factor=v_max_factor,
-        n_v=n_v,
-        t_end_factor=400.0
-    )
-    alpha_array.append(alpha_i)
+alpha_array = compute_mSAS_alpha(
+    delta_array_Hz,
+    N,                # total number density (m^-3) for the isotope 
+    I_pr_Wm2,
+    I_pu_Wm2,
+    v_max_factor=v_max_factor,
+    n_v=n_v,
+    t_end_factor=400.0
+)
 t1 = time()
 print(f" Done alpha0 calculation in {t1 - t0:.1f} s")
 delta_array_MHz = delta_array_Hz / 1e6
@@ -696,10 +696,10 @@ delta_array_MHz = delta_array_Hz / 1e6
 # ------------------------------
 # Save detuning and alpha to TXT
 # ------------------------------
-output_filename = "bSAS_alpha_output.txt"
+output_filename = "mSAS_alpha_output.txt"
 
 # Stack into two columns: detuning (MHz) and alpha (1/m)
-data_to_save = np.column_stack([delta_array_MHz, alpha_array[0], alpha_array[1], alpha_array[2], alpha_array[3]])
+data_to_save = np.column_stack([delta_array_MHz, alpha_array])
 
 np.savetxt(
     output_filename,
@@ -709,9 +709,7 @@ np.savetxt(
     comments=""
 )
 
-print(f"Saved bSAS α(Δ) to {output_filename}")
-
-
+print(f"Saved mSAS α(Δ) to {output_filename}")
 
 # filename = "mSAS_alpha_output.txt"
 
@@ -721,15 +719,13 @@ print(f"Saved bSAS α(Δ) to {output_filename}")
 # alpha_array = data[:, 1]
 
 plt.figure(figsize=(8,5))
-plt.plot(delta_array_MHz, alpha_array[0], label=pump_labels[0])
-plt.plot(delta_array_MHz, alpha_array[1], label=pump_labels[1])
-plt.plot(delta_array_MHz, alpha_array[2], label=pump_labels[2])
-plt.plot(delta_array_MHz, alpha_array[3], label=pump_labels[3])
+plt.plot(delta_array_MHz, alpha_array, label=r'$\alpha_{mSAS}$')
 plt.xlabel('Detuning (MHz)')
 plt.ylabel('Absorption coefficient α (1/m)')
-plt.title('Bichromatic SAS absorption')
+plt.title('Monochromatic SAS absorption')
 plt.grid(True)
 plt.legend()
 plt.tight_layout()
 plt.show()
+
 
